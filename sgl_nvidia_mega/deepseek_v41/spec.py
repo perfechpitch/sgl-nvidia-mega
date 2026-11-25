@@ -75,7 +75,13 @@ SGLANG_READS = {
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
 # the SGLang megakernel contract this spec is written against
-API_VERSION = 2
+# Local (B300) adjustment: bumped 2 -> 3 to match sglang's MEGAKERNEL_API_VERSION.
+# v3 (sglang commit e96e967570, PR #52054) replaced VerifySamplingView's
+# additive_penalties/scaling_penalties with step_penalties.apply_verify(). This
+# spec never reads either: the deepseek_v41 package does not import spec_step/lifted,
+# does not call apply_dflash_verify_logits_adjustments or apply_acc_penalties, and
+# never constructs a VerifySamplingView, so the v3 contract is a no-op here.
+API_VERSION = 3
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
 # sha256 of its source. FlashInfer 0.7.0-0.7.2 share one file; 0.7.3 only adds
 # tactic-enumeration caching, leaving the kernel class (including epilog_warp)
