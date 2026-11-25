@@ -136,6 +136,14 @@ SHIPPED_SLOTS = (
     # store also releases before it stores; its rows are still gathered before the wait
     "kv_before_wait",
     *DEFAULT_ON_SLOTS,
+    # Local (B300) adjustment: `sm148` is an opt-in coverage marker, not a kernel
+    # slot. It must live in SLOTS for spec.resident_blocks() to admit 148 SMs
+    # instead of 152. Passing it through SGLANG_NVIDIA_MEGAKERNEL_SLOTS would
+    # replace this whole list, and because default_start() then turns False it
+    # would also force on wo_b_publish_split (+94 us/step at TP4) and
+    # attn_q_cluster (+21 us/step at TP4), both measured slower there. Listing it
+    # here keeps the measured default-start behaviour intact.
+    "sm148",
 )
 # the draft's slots, which build with the draft spec
 DRAFT_SLOTS = frozenset(
