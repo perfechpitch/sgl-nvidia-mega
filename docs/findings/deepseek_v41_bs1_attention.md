@@ -510,15 +510,33 @@ Per step (mean of 50, device 0, all eight ranks run the same shape):
 |---|---|---|
 | step wall (stamp to stamp) | 3606 | |
 | **union GPU busy** | **2781** | **77.1 %** |
-| **true GPU idle** | **825** | **22.9 %** |
+| **apparent GPU idle** | **825** | **22.9 %** |
 | kernel work (sum of durations) | 6153 | 2.21x parallelism |
 
-The 825 us of idle is not spread thin: 3.5 stalls over 50 us per step account for **652 of
-the 825**, and they sit before tiny `at::native::` elementwise kernels and before the next
-step's stamp -- at +682, +991 and +1067 us into the step. Gaps under 2 us contribute 50 us
-in total. So this is host/queue stalls at the draft/verify seam and at the step boundary,
-not launch overhead on the layer chain. **Cutting the idle is worth more than any kernel
-here**: 825 us of a 3606 us step is 23 %.
+**Most of that "idle" is the tracer, not the machine.** The same process measured the same
+row twice: once with the capture window open and once with `nsys` running but not
+collecting, so the only difference is the collection itself.
+
+| run | step p50 |
+|---|---|
+| no `nsys` at all (`ab_nomoe`, 8 bench32 rows) | 2.835 ms |
+| `nsys` attached, **not** collecting (`n32k3-warm`) | **2.798 ms** |
+| `nsys` **collecting**, `--cuda-graph-trace=node` (`n32k3-dec`) | 3.432 ms |
+
+Node-mode collection costs ~0.60 ms a step, against a 0.57 ms warm/untraced delta of 0.04.
+So of the 825 us of apparent idle, ~600 us is the tracer re-instrumenting every node of the
+graph and the real idle is roughly **225 us, about 8 % of the step** -- a different problem
+from the 23 % it looks like. Read the traced 3606 us as an upper bound, not as the shipped
+step.
+
+What is real behind the number: per rank the host does ~115 CUDA API calls a step and spends
+~788 us in them (22 % of the step, itself tracer-inflated), split by gap into 516 us of
+host-API stalls over 4.4 gaps and 193 us of pure-Python stalls over 1.1 gaps. 98.2 % of the
+48233 kernels in the window are inside the CUDA graph; the 17.5 a step that are not are the
+`at::native::` elementwise / `multi_tensor_apply` / `index_elementwise` tail, and those are
+exactly the gap points (`cudaLaunchKernel_v7000` 16.4 a step, each paired 1:1 with a
+`cuKernelGetName`, plus a `cudaStreamIsCapturing` 24 a step). So the lever is fewer host
+launches a step -- graph-capture or drop that tail -- and it is worth ~0.2 ms, not 0.8.
 
 Kernel work, in order (`us/step` is the sum of durations, so these overlap 2.21x):
 
@@ -548,8 +566,12 @@ DeepGEMM's order, or a second CTA an SM (92 KB of smem against 180 KB free).
 
 ## Open (decode profile)
 
-- **The 825 us of idle** (3 host/seam stalls): this is the first thing to chase, and it is
-  worth 23 % of the step. Chase it with the host timeline in the same report, not with a
-  kernel.
+- **The apparent 825 us of idle is mostly the tracer.** Measured control: the same row costs
+  3.432 ms collected (`--cuda-graph-trace=node`) and 2.798 ms with `nsys` attached but not
+  collecting, so ~600 us a step is collection. The real idle is ~225 us (8 %), and it is the
+  ~17.5 host launches a step that sit outside the CUDA graph -- graph-capture that tail or
+  delete it. Do not chase it with a kernel, and do not trust traced step times as shipped
+  numbers.
 - `dsv41_hc_coeff` at 16 of 148 SMs: 1070 us of work a step. Anything that raises its
-  occupancy pays directly, if the slice order survives.
+  occupancy pays directly, if the slice order survives. This one is not a tracer artefact:
+  it is GPU work, measured inside the graph.
