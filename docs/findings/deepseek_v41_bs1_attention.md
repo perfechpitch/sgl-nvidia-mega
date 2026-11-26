@@ -740,3 +740,45 @@ closed, not merely expensive.** The only build that would move it is a deeper ch
 
 **Read this as: the K-loop lever is closed at 256 N by smem, and the tile-width escape
 route costs more than it saves.**
+
+## Wider DSpark blocks: the verify side costs more than the token it buys
+
+`dspark_block_size` is 5 in the checkpoint's own `config.json`, so a step drafts 5 and
+verifies 6 rows. Block 10 drafts 10 and verifies 11. The MoE half of that trade is
+measured, on an idle node, with `benchmark/probe_deepseek_v41_rows.py`:
+
+| verify | rows | distinct | ctas | MoE half |
+|---|---:|---:|---:|---:|
+| block 5 (shipped) | 6 | 19 | 36 | **15.22 us** |
+| block 10 | 11 | 30 | 66 | **19.96 us** |
+
+**+4.74 us a layer, +190 us over 40 layers.** Extrapolating by distinct-expert count
+(the 0.21 us a distinct expert in the MoE section above) predicts only +2.55 us, so the
+expert count is the smaller half: `ctas` goes 36 -> 66 because 11 rows x top-6 is 66
+slots, and the tile count is the pipeline. The draft side could not be measured the same
+way -- that bench's route record is built for 6 x 6 and stalls at 5 x top-3 even with the
+expert window widened to 300 -- but its `ctas` also doubles (15 -> 30), so it lands in the
+same place at 3 stages, ~+21 us.
+
+Step time therefore goes 2725 -> ~2936 us (**+7.7 %**), and `tok/s` is accepted length over
+step time, so acceptance has to rise from 3.55 to **3.82 (+7.7 %) just to break even**.
+
+### Why that break-even is the wrong side to bet on
+
+Two independent reasons, both structural rather than measured:
+
+- **Block size is a training attribute here, not an inference knob.** The draft's three
+  stages and its Markov head were trained on 5 positions; positions 6-10 are an
+  extrapolation of the trained distribution. The usual shape of speculative decoding is
+  that a longer block *lowers* the accept rate per position, because more consecutive
+  hits are needed to stay ahead.
+- **`attn_core_lean` serves 1-8 rows only.** At 11 rows the verify falls back to the
+  swap-AB sparse MLA path, which is the 174 us a verify step that slot was built to
+  remove (`bench_deepseek_v41_bs1_attention.md`, the `attn_core_lean` arm). So the real
+  cost of block 10 is +190 us of MoE **plus** most of that 174 us back -- roughly +13 % a
+  step, needing acceptance at 4.0 to break even.
+
+Decision: stay at block size 5 / 6-row verify. The cost is measured, the acceptance leg
+is not testable without restarting the server at a width the checkpoint was not trained
+for, and every structural signal points the same way. Recorded so the next attempt starts
+from the number rather than from the intuition that a wider block is free throughput.
