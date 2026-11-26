@@ -154,10 +154,13 @@ alone at TP8 unless this pair is re-measured to a resolved gain.
 Two things this session showed, both worth building into the next measurement:
 
 - **Arms must be interleaved, not sequential.** Three arms ran back to back over 16
-  minutes and every arm's steps trended up within its own run (by thirds: `base`
-  2761.7 -> 2833.5 us, `lean` 2720.3 -> 2797.5, `stack` 2748.6 -> 2781.1). That drift is
-  50-70 us, the same size as the effect, so an arm that ran later starts behind. Only the
-  paired per-row comparison above is clean of it; the period medians are not.
+  minutes, and the last stretch of every run reads high: binned into eighths, `base`
+  holds 2758-2793 us for six bins then reads 2870 and 2898, `lean` holds 2692-2790 then
+  2790 and 2840, `stack` holds 2712-2806 then 2740 and 2853. The lift is 80-120 us and
+  arrives at the same point in all three arms, so it is not thermal and not a property of
+  the kernels: every GPU held its 2032 MHz maximum clock with no throttle reason through
+  the runs, at 40-45 C. Treat the tail of a run as suspect, interleave the arms, and read
+  paired differences rather than arm-wide medians.
 - **The first pass after capture is not a measurement.** The baseline's warm pass ran at
   13.1 ms per step for its whole duration (the client's p50 for that pass: 17.6 ms) while
   its next two passes ran at 2.755 and 2.779 ms. Whatever settles after capture has to
