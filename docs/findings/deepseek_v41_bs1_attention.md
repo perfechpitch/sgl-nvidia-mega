@@ -703,5 +703,40 @@ same 4 % prize is at risk against an unmeasured MMA-efficiency cost. Four couple
 the box in `_weight_map`, the four `a_desc` offsets, `GEMM1_UNITS` 9 -> 18, and the MMA
 shape -- with no way to stage them.
 
-**Read this as: the K-loop lever is 4 %, not 11-23 %, and it is behind a tile-width
-change whose downside is not yet measured.**
+### The 128-N route to a wider chunk is a pure loss, and this is measured
+
+The table above left one question open: a half-width tile is the only build that fits a
+1024-K chunk, so what does half-width cost? A second probe holds TMA traffic and every
+barrier fixed and varies only how many of the four MMA sub-blocks in a K chunk issue. The
+sub-block index is `i_desc >> 29` (the four shipped instructions are 0x08820280,
+0x28820290, 0x488202a0, 0x688202b0), so the helper returns early for `sub >= n`; the commit
+and the mbarrier arrives sit outside the MMA block, so the pipeline shape does not change.
+Wrong output on purpose, D=19, `--side 0`:
+
+| sub-blocks issuing | us/half |
+|---:|---:|
+| 0 (no MMA at all) | 14.07 |
+| 1 | 14.44 |
+| 2 | 14.56 |
+| 4 (shipped) | 15.09 |
+
+**All of GEMM1's MMA issue is 1.02 us of a 15.09 us half, 6.8 %.** The rest is TMA
+latency. Two consequences:
+
+- Adding MMA instructions is nearly free in isolation (0 -> 4 sub-blocks is +1.02 us for
+  the whole tile, and 1 -> 2 is +0.12), which is what a 17.8 % SM utilisation predicts.
+- But **128 N does not reduce the TMA round count at all**, so there is nothing to buy.
+  Per half the A bytes a rank must read are fixed and an A stage is pinned at 65536 B by
+  smem, so rounds = bytes / 65536 is invariant: 256 N runs 9 tiles x 10 chunks and 128 N
+  runs 18 tiles x 5 chunks, both 90 rounds. The K-per-chunk doubling and the tile-count
+  doubling cancel exactly. The only thing 128 N changes is 40 MMA instructions a tile
+  becoming 40 half-MAC instructions across twice the tiles -- double the instructions, same
+  FLOPs, so the 1.02 us becomes ~2.04 us.
+
+A 128-N GEMM1 is therefore the 4.1 % chunk win minus twice the MMA term, i.e. a net loss,
+before its four coupled edits and its unmeasured MMA-efficiency risk. **The chunk lever is
+closed, not merely expensive.** The only build that would move it is a deeper chunk at
+256 N, and 1024 K x 2 stages is 262144 B of A alone against a 232448 B limit.
+
+**Read this as: the K-loop lever is closed at 256 N by smem, and the tile-width escape
+route costs more than it saves.**
