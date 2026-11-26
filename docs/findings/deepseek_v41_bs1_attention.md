@@ -252,15 +252,49 @@ not a win to report.
 
 ## What to do next
 
-The MoE is where the remaining time is, and it runs far below the memory roofline. Each
-verify step spends about 28 us a layer on the routed pair, 45 % of a layer's 61.6 us, and
-reads roughly 44 MB per rank to do it (6 rows, ~19 distinct experts, ~10 of them per EP
-half, ~4.2 MiB an expert per MoE-TP4 rank at the checkpoint's `[2304, 2560]` int8 w1/w3
-shapes). 44 MB in 28 us is about 1.6 TB/s against a B300's ~8 TB/s, so the gather runs at
-around 20 % of peak: latency- and occupancy-bound rather than bandwidth-bound, because 6
-rows give the MMA almost no work to hide it behind. That is the one lever left with more
-than a few percent of headroom, and it is deep kernel work (`sm103/moe/src/route*.cu`,
-`routed_expert_gemm.py`), not a slot to switch on.
+The MoE is where the remaining time is. Each verify step spends about 28 us a layer on the
+routed pair (45 % of a layer's 61.6 us) and reads roughly 44 MB per rank to do it: 6 rows,
+~19 distinct experts, ~10 of them per EP half, ~4.6 MB an expert per MoE-TP4 rank
+(`GEMM1_UNITS` 9 x 128 rows of w13 over K 5120 at MXFP4, plus 5120 x 640 of w2).
+
+That 28 us is an in-model attribution, not the kernel's own cost. Measured in isolation
+with `benchmark/bench_deepseek_v41_routed_moe.py` (one EP2 rank's window,
+`--local-experts 192 --offset 0`, 3 repeats, spread <= 0.03 us, spacer of two empty
+kernels in the same graph subtracted), the shipped pair is **15.15 us a half** at 19
+distinct experts (19.14 us with a shared-expert-sized chain beside it on a second stream).
+
+The shape of that number is the point, and it is not what the previous version of this
+section claimed. Sweeping the distinct-expert count:
+
+| distinct | `pipe_clc` us/half |
+|---------:|-------------------:|
+| 1        | 11.41              |
+| 4        | 11.81              |
+| 8        | 12.28              |
+| 19       | 15.15              |
+
+An extra distinct expert costs 0.21 us, i.e. ~0.42 us for the ~half of them this rank
+owns, which for ~4.6 MB is faster than the part's memory could deliver it. Adding work is
+therefore nearly free, and **the half is fixed-latency bound, not bandwidth bound**: at 19
+experts the whole half averages 2.9 TB/s (36 % of ~8 TB/s) but 11.4 of its 15.2 us is the
+floor at one expert, where only ~2.3 MB moves and the roofline would be 0.3 us. So ~75 %
+of the routed pair is pipeline fill, tensor-map/first-use latency, the mbarrier chain and
+the GEMM1 -> GEMM2 hand-off, repeated on every one of the 39 halves a verify step runs.
+Neither occupancy nor the row count is the limiter, so widening the tiles or splitting K
+buys nothing.
+
+What does have headroom, in the order the measurements support it:
+
+- The floor itself: ~11.4 us a half against a 0.3 us roofline. The lever is overlapping
+  the next half's GEMM1 fill with this half's GEMM2 drain (or fusing the pair into one
+  launch), not the inner loop.
+- The side stream: putting the shared-expert chain beside the pair costs a flat +4.0 us
+  (19.14 vs 15.15) under every variant, ~8 % of a verify step over 39 halves, and it is a
+  scheduling change rather than kernel work.
+- The variant is already the best one: `pipe_clc` (slot `gemm2_pipe` + `gemm2_reg_pool`,
+  both default-on) beats the plain build by 0.6 us a half at every D, and `pool_clc` ties
+  it. Taking the route kernel off the chain (`preroute+`) is 0.4 us *slower*, so routing is
+  already fully hidden and is not a candidate.
 
 Before that, the harness: with the remaining per-slot effects at 0.5-1.5 % and this
 node's launch-to-launch spread at 1.4 %, a sequential A/B cannot resolve them. Interleave
