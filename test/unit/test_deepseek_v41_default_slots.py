@@ -17,7 +17,6 @@ NUMERICS_DEFAULT_ON = {
     "attn_q_cluster",
     "draft_shared_ll",
     "wo_b_publish_split",
-    "moe_balanced",
 }
 
 
@@ -25,8 +24,8 @@ def test_the_default_on_slots_are_shipped_and_not_opt_in():
     on = set(runtime.DEFAULT_ON_SLOTS)
     assert on <= set(runtime.SHIPPED_SLOTS)
     assert not on & set(runtime.OPT_IN_SLOTS)
-    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 31
-    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 72
+    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 30
+    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 71
 
 
 def test_the_shipped_list_needs_no_opt_in_slot(monkeypatch):
@@ -73,6 +72,9 @@ def test_the_numerics_changing_default_slots_are_labelled():
         "draft_lm_head_mxfp8",
         # no resolved served gain alone
         "draft_stage0_first",
+        # measured slower at attention TP8 + EP2 (597 us a step): opt-in for the layout
+        # it was measured on
+        "moe_balanced",
     ],
 )
 def test_the_remaining_slots_stay_opt_in(slot):

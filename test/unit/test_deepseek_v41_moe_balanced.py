@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Slot moe_balanced on CPU: on by default, a numerics change, needs moe; the pair's
+"""Slot moe_balanced on CPU: opt-in (it measured 597 us a step slower at attention
+TP8 + EP2), a numerics change, needs moe; the pair's
 weights per SGLang storage (range split, balanced storage without the slot: the rank's EP
 window, balanced storage with it: every expert, a 384-entry clamp and the rank's EP group
 as deal group); reported built only when a pair deals, so a default start without the
@@ -17,10 +18,13 @@ from sgl_nvidia_mega.deepseek_v41.moe import routed
 E, LOCAL = 384, 192
 
 
-def test_the_slot_runs_by_default_labelled_numerics_and_needs_moe(monkeypatch):
-    assert "moe_balanced" in runtime.DEFAULT_ON_SLOTS
+def test_the_slot_is_opt_in_labelled_numerics_and_needs_moe(monkeypatch):
+    """Off by default: at attention TP8 + EP2 it measures 1768.8 tok/s/user with it off
+    against 1453.9 with it on (597 us a step), same 8 bench32 rows."""
+    assert "moe_balanced" in runtime.OPT_IN_SLOTS
+    assert "moe_balanced" not in runtime.DEFAULT_ON_SLOTS
+    assert "moe_balanced" not in runtime.SHIPPED_SLOTS
     assert "moe_balanced" in runtime.NUMERICS_CHANGE_SLOTS
-    assert "moe_balanced" not in runtime.OPT_IN_SLOTS
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"moe_balanced"}))
     assert any("needs slot 'moe'" in r for r in runtime.slot_reasons())
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"moe", "moe_balanced"}))

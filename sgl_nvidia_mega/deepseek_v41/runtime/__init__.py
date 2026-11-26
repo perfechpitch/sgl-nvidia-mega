@@ -54,7 +54,9 @@ DEFAULT_ON_SLOTS = (
     "attn_q_cluster",
     "draft_shared_ll",
     "wo_b_publish_split",
-    "moe_balanced",
+    # moe_balanced is NOT here: at attention TP8 + EP2 it measures 1768.8 tok/s/user
+    # (step p50 2.835 ms) with it off against 1453.9 (3.432 ms) with it on, over the same
+    # 8 bench32 rows -- 597 us a step. It stays opt-in for the layout it was measured on.
 )
 # The slots that are not bitwise with the path they replace (a different summation order
 # or encoding; the step's accuracy is checked with evals, not bit for bit)
@@ -308,6 +310,9 @@ OPT_IN_SLOTS = (
     "draft_final_collapse",
     # no resolved served gain alone (its gain needs SGLang-side draft-metadata changes)
     "draft_stage0_first",
+    # measured 597 us a step slower at attention TP8 + EP2 (1768.8 tok/s/user with it off
+    # against 1453.9 with it on); opt-in for the layout it was measured on
+    "moe_balanced",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -468,6 +473,7 @@ def slot_reasons() -> list[str]:
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
+    "srt/environ.py": ("envs", "SGLANG_DSV4_KV_LAYOUT"),
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_group"',
