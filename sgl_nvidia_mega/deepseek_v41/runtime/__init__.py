@@ -313,6 +313,14 @@ OPT_IN_SLOTS = (
     # measured 597 us a step slower at attention TP8 + EP2 (1768.8 tok/s/user with it off
     # against 1453.9 with it on); opt-in for the layout it was measured on
     "moe_balanced",
+    # early_trigger_start: hop A's Lamport consumer (the attention post) also lets its
+    # dependents launch at its *start*, not at its poll. Hop B's equivalent (slot
+    # hop_b_start_trigger) pays off because it waits on the MoE finalize; hop A's wait is
+    # too short to hide a GEMM prologue, so the trigger costs more than it saves: measured
+    # 2718.2 -> 2737.2 us a step (in-graph period p50), verify half 2433.4 -> 2454.8, and
+    # 1237.7 -> 1216.7 tok/s/user over the same 8 bench32 rows. Kept as a switch to
+    # re-measure on a layout with a wider hop A wait, not for default duty.
+    "early_trigger_start",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -403,6 +411,7 @@ def slot_reasons() -> list[str]:
         ("index_q_mxfp8_in", "attn"),
         ("hop_b", "hop_a"),
         ("early_trigger", "hop_a"),
+        ("early_trigger_start", "hop_a"),
         ("hop_b_start_trigger", "hop_b"),
         ("hop_b_wide", "hop_b"),
         ("hop_b_wide", "attn_qkv_a"),
@@ -676,6 +685,9 @@ def build(model, ctx):
         "hc_prenorm": bound["boundary"].prenorm,
         "hc_coeff_fused": bound["boundary"].prenorm and bool(prenorm.fused()),
         "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
+        # the hop A consumer triggers at its start instead of at its poll (slot
+        # early_trigger_start); it is the same kernel switch, one step earlier
+        "early_trigger_start": "early_trigger_start" in SLOTS and facts.hop_a,
         "hop_a_batch2": any(
             s.hop_a and w > slot_plan.HOP_A_BATCH1_ROWS for w, s in slots.items()
         ),

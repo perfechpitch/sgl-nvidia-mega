@@ -1223,7 +1223,7 @@ class AllReduceMHC:
         group: dist.ProcessGroup,
         quantize_layer_input: bool = False,
         residual_only: bool = False,
-        early_trigger: bool = False,
+        early_trigger: bool | str = False,
         hop_b_start_trigger: bool = False,
         row_tile_layer_input: bool = False,
         publish_trigger_max_rows: int = 0,

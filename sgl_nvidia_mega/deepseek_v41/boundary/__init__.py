@@ -87,7 +87,11 @@ def build(model, ctx, group) -> Boundaries:
             ctx,
             group,
             hop_b="hop_b" in runtime.SLOTS,
-            early_trigger="early_trigger" in runtime.SLOTS,
+            early_trigger=(
+                "start"
+                if "early_trigger_start" in runtime.SLOTS
+                else "early_trigger" in runtime.SLOTS
+            ),
             hop_b_start_trigger="hop_b_start_trigger" in runtime.SLOTS,
             batch2="hop_a_batch2" in runtime.SLOTS,
             hop_b_wide="hop_b_wide" in runtime.SLOTS,

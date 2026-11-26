@@ -62,7 +62,7 @@ def build(
     group,
     *,
     hop_b: bool = False,
-    early_trigger: bool = False,
+    early_trigger: bool | str = False,
     hop_b_start_trigger: bool = False,
     batch2: bool = False,
     hop_b_wide: bool = False,
