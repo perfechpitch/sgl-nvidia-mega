@@ -299,16 +299,61 @@ tree; do not redo them.
   15.04 -> 15.04 us, and worse at one expert, 10.88 -> 12.78 us. The 5-stage, 160 KB
   A buffer was therefore not held back by that throttle.
 
+### The trap: a shorter grid looks 25 % faster and is 25 % of the work
+
+`benchmark/bench_deepseek_v41_routed_moe.py`'s own grid is `(units, ctas)` = 1440 blocks
+at the live routing point, which invites "each block does one tile, so shrink the grid and
+make the CTAs persistent". Sweeping the y extent on the shipped `pipe_clc` build reads:
+
+| grid y | side=0 us | side=1 us |
+|-------:|----------:|----------:|
+| 36 (shipped) | 15.04 | 19.08 |
+| 8  | 13.93 | 16.77 |
+| 4  | 12.52 | 14.89 |
+| 2  | 11.46 | 12.59 |
+| 1  | 11.04 | 12.32 |
+
+All of it is dropped work. Comparing the outputs of a one-wave grid against the shipped
+one, `Y` is zero in 112640 of 122880 elements (92 %) of the first half. The kernel's work
+queue is cluster launch control, which hands out only blocks that have not launched yet:
+a grid that already covers the tile space gets nothing back, so shortening it throws tiles
+away instead of concentrating them.
+
+And persistence is already in place, so there is nothing to add. Measured with ncu on the
+shipped grid at D=19:
+
+```
+launch__grid_size                  1440
+sm__ctas_launched.sum               148     one CTA a multiprocessor
+launch__waves_per_multiprocessor   9.73     each resident CTA runs 9.73 tiles
+launch__occupancy_limit_shared_mem  1 block
+```
+
+Only 148 of the 1440 blocks ever launch: each resident CTA pulls its next tile through
+CLC cancellation, 9.73 tiles apiece, exactly grid / SMs. So the fill is already amortised
+over ~10 tiles and no grid or scheduling change can reduce it further. A hand-written
+strided tile walk (replacing the CLC answer in each of the five role warps) was tried as
+well: at the shipped grid it desynchronises the roles and produced NaNs, and it has no win
+to recover even when correct, because the thing it adds already happens.
+
+What is left is the fill itself, paid once a launch: 2 kernels x 39 halves = 78 fills a
+verify step. That is the 42 % intra-CTA barrier stall ncu reports, and reducing it means
+restructuring the prologue of generated code, not a knob. Merging GEMM1 and GEMM2 into one
+launch would halve the fills, but it needs a grid-wide barrier between them, which is only
+deadlock-free if every CTA is resident (grid <= 148); GEMM1's grid is 9 x 36 = 324, and
+shrinking it is exactly the trap above, so a fusion also has to solve the tile walk first.
+
 Cross-process variance, distinct from the 0.03 us spread inside a run: the D=1 floor
 rebuilt and re-run came back 11.41 and then 10.88 us, so compare across launches only
 with ~0.5 us of slack.
 
 What does have headroom, in the order the measurements support it:
 
-- The floor itself: ~11 us a half against a 0.3 us roofline at one expert, i.e. the
-  producer cannot keep enough loads outstanding to reach this part's bandwidth. Neither
-  the throttle nor the PDL release timing is the cause, so this needs the producer and
-  consumer restructured (or the build regenerated) rather than a knob.
+- The fill itself: ~5-9 us a launch, 78 launches a verify step. This is the per-CTA
+  prologue (mbarrier init, tensormap first use, tmem alloc) counted above, and it is the
+  only remaining MoE lever. It needs the generated prologue restructured, or a fused
+  GEMM1+GEMM2 launch (one fill a half instead of two) that also solves the tile walk so a
+  grid-wide barrier stays deadlock-free.
 - The side stream: putting the shared-expert chain beside the pair costs a flat +4.0 us
   (19.14 vs 15.15) under every variant, ~8 % of a verify step over 39 halves, and it is a
   scheduling change rather than kernel work.
