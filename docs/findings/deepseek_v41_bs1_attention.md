@@ -12,6 +12,20 @@ plugin writes in-graph (`SGLANG_NVIDIA_MEGAKERNEL_BENCH_STEP_TIMES`), not client
 | --- | --- | --- |
 | DSpark | `--speculative-algorithm DSPARK --speculative-dspark-block-size 5` | The shipped batch-1 spec setup; each step is a 6-row verify half and a draft half, reported separately |
 | Acceptance | `SGLANG_SIMULATE_ACC_LEN=3.51`, `match-expected`, `real-draft-token` | measurement-only: holds the verify width at 6 rows in every arm, so step times compare; it cannot show accept-rate effects |
+
+The block size and the acceptance length are different quantities and the two get
+confused. Block size 5 is how many draft tokens a step *proposes*; the verify half is
+always 6 rows (1 anchor + 5 draft) whatever happens. The acceptance length is how many of
+those 5 the verify *keeps*, averaged over steps, so a step commits `1 + accepted` tokens.
+3.51 is not a design constant: it is the mean measured on an earlier TP4 run under forced
+acceptance, adopted here so arms share one verify width. With acceptance `a` a step's
+time is set by the 6-row verify and barely moves, while throughput and TPOT scale with
+`a`: TPOT = step time / `a`. Two earlier bench32 runs read mean acceptances of 4.50 and
+4.35 (backed out as tok/s x step time); both ran `ep_size=1` on the mirage static hook
+rather than this package's megakernel, so they bound the arithmetic, not this stack's
+tok/s. At the same step time a run forced to 3.51 reports about 3.51/4.50 = 78 % of what
+those read. Read every tok/s and TPOT number below against the acceptance it was taken
+at.
 | Routing | `SGLANG_NVIDIA_MEGAKERNEL_BENCH_FIXED_ROUTING=synth` | measurement-only: removes expert-selection jitter between arms |
 | Prompts | random token ids, `benchmark/static_table.py --isl 8192 --osl 512 --conc 1` | Seed-stable across arms and pass orders |
 | Passes | warm-up, then one forward and one `--reverse` pass | The mean of the two passes is reported |
@@ -148,6 +162,32 @@ per-layer recovery was exact), so this is the pair's cost, not a refused slot. I
 the result the -13.1 and -7.7 us in the model page should have predicted: at this noise
 level the pair is not resolvable, and here it reads slightly negative. Keep `attn_core_lean`
 alone at TP8 unless this pair is re-measured to a resolved gain.
+
+## The acceptance length, measured
+
+The numbers in this document hold acceptance at 3.51. That sits below what these prompts
+actually reach, so the tok/s figures here are deliberately low. Two lean launches on the
+same stack, same slots and layout, differing only in `SGLANG_SIMULATE_ACC_LEN`, over the
+same 8 bench32 rows:
+
+| Forced acceptance | Period median | bench32 step p50 | bench32 tok/s/user p50 | TPOT |
+| --- | --- | --- | --- | --- |
+| 3.51 | 2725.9 us | 2.828 ms | 1233.2 | 806 us |
+| 5.10 | 2748.9 us | 2.820 ms | 1814.4 | 553 us |
+
+The step time does not move (+23 us in the stamps, -8 us in the client, both inside the
+noise) while throughput rises 47 %. So on this stack the acceptance length sets tok/s and
+TPOT alone, at `TPOT = step / acceptance`, and a step time measured at one acceptance
+carries over to another.
+
+That is the whole of the difference between the 1500 tok/s an earlier bench32 run
+reported and the 1233 here: the earlier run sat at a mean acceptance of 4.50 and this one
+was forced to 3.51 (3.51/4.50 = 78 %, and 1233/1503 = 82 %). It was not a regression, and
+the earlier run is not a baseline for this one in any case: it ran `ep_size=1` and the
+mirage static hook, not this package's megakernel.
+
+Report tok/s and TPOT together with the acceptance they were taken at; without it the
+numbers are not comparable across runs.
 
 ## What the drift means for the method
 
