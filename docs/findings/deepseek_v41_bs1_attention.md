@@ -631,3 +631,77 @@ the right depth.
   interesting for its own sake.
 - **SM slots are oversubscribed, not starved** (176 % of 148 x step), so "find idle time" is
   the wrong frame for this step. Remove work from the dependency chain, do not hunt for gaps.
+
+## The K-chunk chain, measured by chunk count (a probe, not a build)
+
+The routed pair's cost is often described as "a latency chain, and the chain is the K
+loop". That is now measured rather than inferred. Instead of guessing at the shape of a
+larger chunk, the probe keeps the kernel's smem layout and *deletes* chunks: it patches
+every `iter_k* < 10` bound in `gemm1.cu` (and the `iter_k_4 + 1 == 10` last-iteration
+test) to `N`, so GEMM1 reads N of its ten 512-K chunks and accumulates garbage. The
+output is wrong on purpose. Timing stays readable because at D=1 the whole half reads
+2.3 MB, whose roofline is 0.3 us: a microsecond-scale change cannot be bandwidth.
+
+`bench_deepseek_v41_routed_moe.py`-compatible, one GPU, `--side 0`, pipe_clc for GEMM2:
+
+| chunks | D=1 us | D=19 us |
+|-------:|-------:|--------:|
+| 2 | 7.51 | 10.90 |
+| 5 | 9.05 | 12.52 |
+| 7 | 10.01 | 13.54 |
+| 10 (shipped) | 11.45 | 15.11 |
+
+Both columns are linear to within 0.03 us:
+
+```
+D=19   t = 9.866 + 0.525 * chunks     (rms 0.017)
+D=1    t = 6.554 + 0.492 * chunks     (rms 0.026)
+```
+
+Run once with the node otherwise idle. A second run taken 25 minutes earlier had eight
+`saturate_gpu` workers holding every SM at 100 % (clocks 1177-1222 MHz against 2032 idle),
+and that contamination is visible in its control, not in the slope: the shipped pair read
+15.16 there against 15.11 here (+0.3 %) while the spacer read 1.90 us against 1.27
+(+50 %). Interleaved arms absorb a throttled clock; the absolute gap does not. The table
+above is the idle run, and the two agree on the slope to 0.003 us a chunk.
+
+Three things follow, and they reorder this document's priorities:
+
+1. **The 9.89 us intercept at D=19 is GEMM2.** The probe leaves GEMM2 untouched, and
+   GEMM2 alone measures 9.95 us. So the pair at ten chunks is "GEMM2, plus 5.3 us of
+   GEMM1's K rounds that PDL only partly hides". GEMM1's marginal K cost is 0.53 us a
+   chunk; its own fixed part is buried under GEMM2.
+2. **A chunk round is serial, not bandwidth.** 0.494 us a round at D=1 and 0.528 at D=19
+   differ by 7 %, while the bytes a round moves differ by 19x. The round is a TMA
+   round-trip amortised by the three stages: 196608 bytes of A in flight / ~1.5 us is
+   about one round per 0.5 us, which is the measured slope. Depth is therefore the wrong
+   knob as well as bandwidth: five 32-K stages were already tried and came out neutral.
+3. **Halving the chunk count is worth 2.6 us a half, not the 8-9 us a roofline argument
+   suggests.** 10 -> 5 chunks reads 15.11 -> 12.52. Over 43 layers that is 111 us, 4.1 %
+   of the step -- and it is the whole prize, because the intercept is GEMM2 and the K
+   rounds are only 35 % of the half.
+
+### Why the chunk cannot simply be made larger
+
+A 65536-byte A stage holds 256 N x 512 K at MXFP4; ten of those are K 5120. A 1024-K
+chunk needs 131072 bytes a stage, and the block is already at SMEM_TOTAL 216832 B against
+the 232448 B opt-in limit (15516 B spare):
+
+| build | A bytes | total | fits 232448 |
+|---|---:|---:|---|
+| 512 K x 3 stages (shipped) | 196608 | 216832 | yes |
+| 1024 K x 3 stages | 393216 | 413440 | no, over 180992 |
+| 1024 K x 2 stages | 262144 | 282368 | no, over 49920 |
+| 1024 K x 3 stages at 128 N | 196608 | 216832 | **yes, exactly** |
+
+So the only build that fits a 1024-K chunk is a *half-width* tile: 128 N instead of 256,
+which keeps the 65536-byte stage and doubles the K it covers. That build also doubles the
+tile count (18 x 36 = 648, i.e. 4.38 waves a CTA instead of 2.19, better fill
+amortisation) but halves the N of every `tcgen05` MMA, so it doubles the instruction count
+for the same FLOPs. Given a 17.8 % SM utilisation that may be free, but it may not: the
+same 4 % prize is at risk against an unmeasured MMA-efficiency cost. Four coupled edits --
+the box in `_weight_map`, the four `a_desc` offsets, `GEMM1_UNITS` 9 -> 18, and the MMA
+shape -- with no way to stage them.
+
+**Read this as: the K-loop lever is 4 %, not 11-23 %, and it is behind a tile-width
+change whose downside is not yet measured.**
