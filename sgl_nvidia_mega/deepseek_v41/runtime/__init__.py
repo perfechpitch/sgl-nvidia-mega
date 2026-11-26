@@ -44,6 +44,11 @@ DEFAULT_ON_SLOTS = (
     # numerics changes (NUMERICS_CHANGE_SLOTS)
     "swapab_h8",
     "wo_a_g1",
+    # attn_core_lean: muLLM's one-launch sparse attention core at 1-8 rows on attention
+    # TP8's 8 heads, target and draft. It reads the v41_new KV layout only, so it turns
+    # itself off (reported in the build's slot line) unless SGLANG_DSV4_KV_LAYOUT is
+    # v41_new; a numerics change (the V4.1 encodings, P in BF16, muLLM's split order).
+    "attn_core_lean",
     "target_lm_head",
     "target_lm_head_mxfp8",
     "attn_q_cluster",
@@ -300,8 +305,6 @@ OPT_IN_SLOTS = (
     "attn_index_weights_bf16",
     "attn_cluster_merge",
     "attn_wo_a_fp8",
-    # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
-    "attn_core_lean",
     "draft_final_collapse",
     # no resolved served gain alone (its gain needs SGLang-side draft-metadata changes)
     "draft_stage0_first",
@@ -322,6 +325,33 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def kv_layout_v41_new() -> bool:
+    """SGLang's resolved DeepSeek-V4 KV layout (``SGLANG_DSV4_KV_LAYOUT``, v4 by default).
+
+    Slot attn_core_lean reads that layout's packed bytes directly, so it may only run
+    when SGLang is building the v41_new one."""
+    try:
+        from sglang.srt.environ import envs
+
+        mode = envs.SGLANG_DSV4_KV_LAYOUT.get()
+    except Exception:  # no SGLang (unit tests, standalone kernels)
+        mode = os.environ.get("SGLANG_DSV4_KV_LAYOUT", "v4")
+    return str(mode).strip().lower() == "v41_new"
+
+
+def _core_lean_on(slots: frozenset) -> bool:
+    """Slot attn_core_lean runs only where it can: on the v41_new layout it reads, with the
+    swap-AB and fused-wo_a slots that feed it. Missing any of those turns it off (rather
+    than rejecting the request), so a user can turn swapab_h8 off on its own."""
+    return (
+        "attn_core_lean" in slots
+        and "attn" in slots
+        and "swapab_h8" in slots
+        and "wo_a_g1" in slots
+        and kv_layout_v41_new()
+    )
 
 
 def default_start() -> bool:
@@ -413,9 +443,9 @@ def slot_reasons() -> list[str]:
         ("attn_q_cluster", "attn"),
         ("attn_wo_a_fp8", "attn"),
         ("attn_compressor_priority", "attn"),
-        ("attn_core_lean", "attn"),
-        ("attn_core_lean", "swapab_h8"),
-        ("attn_core_lean", "wo_a_g1"),
+        # attn_core_lean's prerequisites (attn, swapab_h8, wo_a_g1) are a soft
+        # condition: it turns itself off when they are missing (runtime._core_lean_on),
+        # so a user turning swapab_h8 off does not have to list attn_core_lean too
         ("wo_b_publish_split", "hop_a"),
         ("engram_publish", "engram"),
         ("moe_balanced", "moe"),

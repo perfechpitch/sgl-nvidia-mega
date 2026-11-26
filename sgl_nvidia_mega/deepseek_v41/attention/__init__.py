@@ -66,7 +66,7 @@ def _q_cluster_default_takes(attn) -> bool:
 def build(model, ctx, group) -> dict[int, AttentionStep]:
     """Each covered layer's ``AttentionStep`` by layer id; the result is
     ``st.bound["attention"]``."""
-    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, _core_lean_on
 
     m = model.model
     chain_on = "attn" in SLOTS
@@ -117,7 +117,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             cluster_merge="attn_cluster_merge" in SLOTS,
             q_cluster=q_cluster_on,
             wo_a_fp8="attn_wo_a_fp8" in SLOTS,
-            core_lean="attn_core_lean" in SLOTS,
+            core_lean=_core_lean_on(SLOTS),
         )
         if chain_on:
             ops0 = step_.chain[0]

@@ -200,6 +200,7 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
     """Each ported stage's kernels by layer id; a stage left out keeps SGLang's call
     (slot draft_attn off, or SGLang's draft without its fast kernels)."""
     from sgl_nvidia_mega.deepseek_v41 import sglang_ops
+    from sgl_nvidia_mega.deepseek_v41.runtime import _core_lean_on
 
     # unified KV writes the draft window through a ring the binding does not offer
     if "draft_attn" not in slots or sglang_ops.unified_kv_triton():
@@ -226,7 +227,7 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
             kv_before_wait="draft_swapab" in slots and "kv_before_wait" in slots,
             cluster_merge="draft_swapab" in slots and "attn_cluster_merge" in slots,
             core_lean="draft_swapab" in slots
-            and "attn_core_lean" in slots
+            and _core_lean_on(slots)
             and wo_a
             and attn.n_local_heads == 8
             and chain.swapab_applies(attn, heads8=True),

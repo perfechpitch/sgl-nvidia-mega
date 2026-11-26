@@ -11,6 +11,7 @@ from sgl_nvidia_mega.deepseek_v41 import plan, runtime
 NUMERICS_DEFAULT_ON = {
     "swapab_h8",
     "wo_a_g1",
+    "attn_core_lean",
     "target_lm_head",
     "target_lm_head_mxfp8",
     "attn_q_cluster",
@@ -24,8 +25,8 @@ def test_the_default_on_slots_are_shipped_and_not_opt_in():
     on = set(runtime.DEFAULT_ON_SLOTS)
     assert on <= set(runtime.SHIPPED_SLOTS)
     assert not on & set(runtime.OPT_IN_SLOTS)
-    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 30
-    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 70
+    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 31
+    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 72
 
 
 def test_the_shipped_list_needs_no_opt_in_slot(monkeypatch):
@@ -57,8 +58,6 @@ def test_the_numerics_changing_default_slots_are_labelled():
 @pytest.mark.parametrize(
     "slot",
     [
-        # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
-        "attn_core_lean",
         # no resolved served gain
         "draft_final_collapse",
         # a small gain (2 + 2 launches, or one GPU only) that a longer A/B has not confirmed
