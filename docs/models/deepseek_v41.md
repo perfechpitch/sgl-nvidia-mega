@@ -135,6 +135,8 @@ SGLANG_NVIDIA_MEGAKERNEL_SLOTS=$(python -c "from sgl_nvidia_mega.deepseek_v41.ru
 
 Under `v41_new` swap-AB declines (it reads only the V4 layout), so verify steps above 8 rows run SGLang's attention and are much slower; do not set it for batched serving or at TP4.
 
+Measured on B300 at attention TP8 + MoE TP4 x EP2, batch 1, DSpark acceptance forced to 3.51 and fixed routing: -183 us per step, or -6.3 % of the period, more than the 130 us above (an earlier stack); 174 us of it is in the 6-row verify half, and the kernel checks against an fp64 reference at relative RMS < 4e-3. The measurement setup, its noise floor and what the fixed-routing setting bounds are in [the batch-1 attention findings](../findings/deepseek_v41_bs1_attention.md).
+
 SGLang fuses its all-reduce + mHC posts only at TP2 and TP4. At TP8 the target's posts run on the plugin's hops (hop A, hop B and the two-shot) and the draft's posts on a Lamport mailbox of their own (slot `draft_hop`, shipped; it builds nothing at TP4). At startup the draft logs each requested draft slot as built, declined (with the reason) or not needed.
 
 ## Manual tests
