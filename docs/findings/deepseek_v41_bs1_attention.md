@@ -276,18 +276,39 @@ section claimed. Sweeping the distinct-expert count:
 An extra distinct expert costs 0.21 us, i.e. ~0.42 us for the ~half of them this rank
 owns, which for ~4.6 MB is faster than the part's memory could deliver it. Adding work is
 therefore nearly free, and **the half is fixed-latency bound, not bandwidth bound**: at 19
-experts the whole half averages 2.9 TB/s (36 % of ~8 TB/s) but 11.4 of its 15.2 us is the
-floor at one expert, where only ~2.3 MB moves and the roofline would be 0.3 us. So ~75 %
-of the routed pair is pipeline fill, tensor-map/first-use latency, the mbarrier chain and
-the GEMM1 -> GEMM2 hand-off, repeated on every one of the 39 halves a verify step runs.
-Neither occupancy nor the row count is the limiter, so widening the tiles or splitting K
-buys nothing.
+experts the whole half averages 2.9 TB/s but 11.4 of its 15.2 us is the floor at one
+expert, where only ~2.3 MB moves and the roofline would be 0.3 us. For scale, the same
+bench's `--bandwidth` probe reads a 4 GiB buffer at **6.29 TB/s** on this part, so the
+routed pair at the live routing point runs at 47 % of what the memory can actually
+deliver (not 20 % against a spec 8 TB/s). Neither occupancy nor the row count is the
+limiter, so widening the tiles or splitting K buys nothing.
+
+### Tried and reverted: the two cheap overlap levers
+
+Both were measured in `bench_deepseek_v41_routed_moe.py` and both are back out of the
+tree; do not redo them.
+
+- Releasing the dependents at CTA entry (an extra `griddepcontrol.launch_dependents` in
+  `gemm1.cu` and `gemm2_pipe.cu`, leaving the existing end-of-loop release to no-op)
+  costs rather than saves: 15.15 -> 15.65 us at D=19 and 19.14 -> 22.67 us with the side
+  stream, because the next stage's CTAs go resident early, pay their mbarrier init and
+  squat on SMs the current stage still needs. Correctness is unaffected either way (a
+  dependent reads only after its own wait).
+- Widening the K-loop throttle from 3 to 5 stages (5 barriers each, `throttle_empty`
+  moved to 240 so the wider `throttle_full` fits) is neutral at the live routing point,
+  15.04 -> 15.04 us, and worse at one expert, 10.88 -> 12.78 us. The 5-stage, 160 KB
+  A buffer was therefore not held back by that throttle.
+
+Cross-process variance, distinct from the 0.03 us spread inside a run: the D=1 floor
+rebuilt and re-run came back 11.41 and then 10.88 us, so compare across launches only
+with ~0.5 us of slack.
 
 What does have headroom, in the order the measurements support it:
 
-- The floor itself: ~11.4 us a half against a 0.3 us roofline. The lever is overlapping
-  the next half's GEMM1 fill with this half's GEMM2 drain (or fusing the pair into one
-  launch), not the inner loop.
+- The floor itself: ~11 us a half against a 0.3 us roofline at one expert, i.e. the
+  producer cannot keep enough loads outstanding to reach this part's bandwidth. Neither
+  the throttle nor the PDL release timing is the cause, so this needs the producer and
+  consumer restructured (or the build regenerated) rather than a knob.
 - The side stream: putting the shared-expert chain beside the pair costs a flat +4.0 us
   (19.14 vs 15.15) under every variant, ~8 % of a verify step over 39 halves, and it is a
   scheduling change rather than kernel work.
