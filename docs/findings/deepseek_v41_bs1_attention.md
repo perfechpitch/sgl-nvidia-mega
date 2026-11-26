@@ -557,12 +557,20 @@ Kernel work, in order (`us/step` is the sum of durations, so these overlap 2.21x
 86 launches a step (43 layers, draft and verify), 12.5 us each. It launches
 (`slices`, 1, 1) = **16 CTAs** because `SLICES = 16` is `prenorm.SLICES`, DeepGEMM's
 `kNumSplits`, which the kernel's slice-ordered tail reduce must keep to stay bit for bit.
-On a 148-SM B300 those 16 CTAs occupy 10.8 % of the machine, so each call pays a full
-K-loop latency (28 chunks of 64) with nothing beside it. The kernel is already the fused
-fast path -- it replaced `tf32_hc_prenorm_gemm` (15.6 us) + `_hc_mix_reduce_sinkhorn`
-(7.4 us) = 23 us with one 12.5 us launch -- so the remaining lever is not another fusion
-but the occupancy, and that needs either a slice count the tail reduce still sums in
-DeepGEMM's order, or a second CTA an SM (92 KB of smem against 180 KB free).
+K is `hc * hidden` = 4 * 5120 = 20480, so 320 K-blocks of 64 land 20 a split with no
+remainder, and each CTA walks all 20 (12 stages is the right depth for 20, not slack).
+On a 148-SM B300 those 16 CTAs occupy 10.8 % of the machine, so each call pays the whole
+K-loop latency with nothing beside it. The kernel is already the fused fast path -- it
+replaced `tf32_hc_prenorm_gemm` (15.6 us) + `_hc_mix_reduce_sinkhorn` (7.4 us) = 23 us with
+one 12.5 us launch -- so the remaining lever is not another fusion but the occupancy.
+
+**Two CTAs an SM is closed, two ways.** The kernel's smem is 192.4 KiB
+(`smem_bytes()` = 197008: 12 stages x 16 KiB + barriers), not 92 KB, so on a 227 KiB SM one
+CTA excludes a second outright -- the build carries `__launch_bounds__(256, 1)` for that
+reason. And it would not help anyway: the grid is 16 CTAs in total, so two a SM would pack
+them onto 8 SMs, not reach more of the 148. Reaching more SMs needs a larger `kNumSplits`,
+and that changes which partial sums the tail adds, so it is bit-exact only if the split
+boundaries stay where DeepGEMM put them -- i.e. it is a numerics change, not a free win.
 
 ## Open (decode profile)
 
@@ -572,6 +580,8 @@ DeepGEMM's order, or a second CTA an SM (92 KB of smem against 180 KB free).
   ~17.5 host launches a step that sit outside the CUDA graph -- graph-capture that tail or
   delete it. Do not chase it with a kernel, and do not trust traced step times as shipped
   numbers.
-- `dsv41_hc_coeff` at 16 of 148 SMs: 1070 us of work a step. Anything that raises its
-  occupancy pays directly, if the slice order survives. This one is not a tracer artefact:
-  it is GPU work, measured inside the graph.
+- `dsv41_hc_coeff` at 16 of 148 SMs: 1070 us of work a step. Occupancy is pinned by
+  `kNumSplits = 16` (bit-exact tail reduce), and 2 CTAs an SM is closed (192.4 KiB smem, and
+  16 CTAs would just pack onto 8 SMs). Anything that raises its occupancy is a numerics
+  change; within bit-exactness the levers are the 20-iteration K loop's own latency
+  (cast stages, TMA depth) and running it beside other work, not adding CTAs.
