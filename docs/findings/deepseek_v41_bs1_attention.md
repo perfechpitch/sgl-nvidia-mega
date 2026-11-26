@@ -547,41 +547,87 @@ Kernel work, in order (`us/step` is the sum of durations, so these overlap 2.21x
 | 499.4 | 43.0 | `dsv41_routed_expert_gemm1` |
 | 439.5 | 43.0 | `SwigluLowLatency` |
 | 371.6 | 58.0 | `dsl low_latency_blockscaled` |
-| 339.2 | 43.0 | `dsv41_wo_b_split` |
+   550|| 339.2 | 43.0 | `dsv41_wo_b_split` |
 | 330.8 | 43.0 | `dsv41_wo_a_fused` |
 | 320.4 | 43.0 | `dsv41_routed_expert_gemm2` |
 | 237.0 | 38.0 | `dsv41_core_lean_sparse_early` |
 | 232.1 | 32.0 | `dsv41_q_cluster8_fit` |
 
-**`dsv41_hc_coeff` is the largest single consumer of GPU work and it is 10 % occupied.**
-86 launches a step (43 layers, draft and verify), 12.5 us each. It launches
-(`slices`, 1, 1) = **16 CTAs** because `SLICES = 16` is `prenorm.SLICES`, DeepGEMM's
-`kNumSplits`, which the kernel's slice-ordered tail reduce must keep to stay bit for bit.
-K is `hc * hidden` = 4 * 5120 = 20480, so 320 K-blocks of 64 land 20 a split with no
-remainder, and each CTA walks all 20 (12 stages is the right depth for 20, not slack).
-On a 148-SM B300 those 16 CTAs occupy 10.8 % of the machine, so each call pays the whole
-K-loop latency with nothing beside it. The kernel is already the fused fast path -- it
-replaced `tf32_hc_prenorm_gemm` (15.6 us) + `_hc_mix_reduce_sinkhorn` (7.4 us) = 23 us with
-one 12.5 us launch -- so the remaining lever is not another fusion but the occupancy.
+**Read that table as work, not as cost.** It is the sum of each kernel's own duration, and
+these kernels run 2.21x in parallel, so a kernel being top of this table says nothing about
+what a second of it buys. The question that decides where to optimise is *how much the step
+shrinks if the kernel is not there*, i.e. `union(busy) - union(busy without k)`:
+
+| crit us/step | work us/step | n/step | kernel |
+|---|---|---|---|
+| **263** | 577 | 80 | `all_reduce_mhc_LamportMHC*` |
+| **180** | 320 | 43 | `dsv41_routed_expert_gemm2` |
+| **60** | 92 | 40 | `all_reduce_mhc` (draft side) |
+| **49** | 116 | 43 | `dsv41_router_mma` |
+| 21 | 1071 | 86 | `dsv41_hc_coeff` |
+| 11 | 237 | 38 | `dsv41_core_lean_sparse_early` |
+| 8 | 339 | 43 | `dsv41_wo_b_split` |
+| 7 | 499 | 43 | `dsv41_routed_expert_gemm1` |
+| 6 | 279 | 46 | `dense_blockscaled` |
+| 5 | 232 | 32 | `dsv41_q_cluster8_fit` |
+| 1 | 372 | 58 | `dsl low_latency_blockscaled` |
+| 0 | 440 | 43 | `SwigluLowLatency` |
+| 0 | 331 | 43 | `dsv41_wo_a_fused` |
+
+`dsv41_hc_coeff` is the largest consumer of GPU *work* and is **almost entirely hidden**:
+removing it entirely would shorten a 2835 us step by **21 us, 0.7 %**. It overlaps with the
+rest of the layer chain and the GPU stays busy. Anybody who tunes it to raise its occupancy
+is tuning a kernel that costs nothing. (This corrects an earlier reading of the same trace
+that mistook the work column for the cost column.)
+
+**The critical path is communication.** `all_reduce_mhc` 263 + a second `all_reduce_mhc` 60
+= 323 of the ~611 us of critical-path kernel time, then `routed_expert_gemm2` 180 (the EP2
+combine) and `router_mma` 49. At batch 1 with TP8 + EP2 the payloads are tiny, so 80
+all-reduces a step at ~3.3 us of exposed latency each are pure latency, not bandwidth.
+
+For completeness, the step is not idle-bound either: SM-slot occupancy summed over the
+window is 176 % of 148 SMs x the step wall, so the GPU is oversubscribed, not starved. The
+levers left are the dependency chain (all-reduce latency, the EP2 combine) and removing
+work from it, not finding idle time.
+
+**Why `dsv41_hc_coeff` looks expensive and is not.** 86 launches a step (43 layers, draft
+and verify) at 12.5 us each, on a grid of (`slices`, 1, 1) = **16 CTAs** -- `SLICES = 16` is
+`prenorm.SLICES`, DeepGEMM's `kNumSplits`, which the kernel's slice-ordered tail reduce must
+keep to stay bit for bit. K is `hc * hidden` = 4 * 5120 = 20480, so 320 K-blocks of 64 land
+20 a split with no remainder and each CTA walks all 20. Profiled at the decode shape
+(`rows = 1`) with `ncu`: duration 12.48 us, but **SM Active Cycles 1276 of 25241 elapsed
+(5 %)**, 0.11 waves, DRAM 2.15 %, compute 1.39 %, achieved occupancy 12 %. So each launch is
+almost all fixed cost and the SMs are idle for most of it -- which is exactly why it hides
+behind the rest of the chain instead of extending it.
 
 **Two CTAs an SM is closed, two ways.** The kernel's smem is 192.4 KiB
-(`smem_bytes()` = 197008: 12 stages x 16 KiB + barriers), not 92 KB, so on a 227 KiB SM one
-CTA excludes a second outright -- the build carries `__launch_bounds__(256, 1)` for that
-reason. And it would not help anyway: the grid is 16 CTAs in total, so two a SM would pack
-them onto 8 SMs, not reach more of the 148. Reaching more SMs needs a larger `kNumSplits`,
-and that changes which partial sums the tail adds, so it is bit-exact only if the split
-boundaries stay where DeepGEMM put them -- i.e. it is a numerics change, not a free win.
+(`smem_bytes()` = 197008: 12 stages x 16 KiB + barriers), not 92 KB, against a 227 KiB SM, so
+one CTA excludes a second outright; `ncu` also shows `Block Limit Registers 1` at 157
+registers a thread. And it would not help anyway: the grid is 16 CTAs in total, so two a SM
+would pack them onto 8 SMs, not reach more of the 148. Reaching more SMs needs a larger
+`kNumSplits`, and that changes which partial sums the tail adds, so it is a numerics change,
+not a free win.
+
+**Depth is not the answer either.** Sweeping `HC_STAGES` in a captured replay of 86
+launches: 12 stages (192.4 KiB) 8.99 us, 8 (128.3 KiB) 8.86, 6 (96.2 KiB) 8.90, 4 (64.1 KiB)
+8.95, 3 (48.1 KiB) 10.18, 2 (32.1 KiB) 11.79 -- flat until the pipeline is too shallow, and
+all outputs bit for bit equal to 12. So the 192 KiB of smem costs nothing and 12 is already
+the right depth.
 
 ## Open (decode profile)
 
+- **The critical path is the all-reduces** (`all_reduce_mhc` 263 + 60 us, `routed_expert_gemm2`
+  180, `router_mma` 49 of ~611 us). At batch 1 with TP8 + EP2 the payload is tiny, so this is
+  latency, not bandwidth: 80 all-reduces a step at ~3.3 us of exposed latency each. That is
+  where the next real win is.
 - **The apparent 825 us of idle is mostly the tracer.** Measured control: the same row costs
   3.432 ms collected (`--cuda-graph-trace=node`) and 2.798 ms with `nsys` attached but not
   collecting, so ~600 us a step is collection. The real idle is ~225 us (8 %), and it is the
   ~17.5 host launches a step that sit outside the CUDA graph -- graph-capture that tail or
   delete it. Do not chase it with a kernel, and do not trust traced step times as shipped
   numbers.
-- `dsv41_hc_coeff` at 16 of 148 SMs: 1070 us of work a step. Occupancy is pinned by
-  `kNumSplits = 16` (bit-exact tail reduce), and 2 CTAs an SM is closed (192.4 KiB smem, and
-  16 CTAs would just pack onto 8 SMs). Anything that raises its occupancy is a numerics
-  change; within bit-exactness the levers are the 20-iteration K loop's own latency
-  (cast stages, TMA depth) and running it beside other work, not adding CTAs.
+- **`dsv41_hc_coeff` is a non-target**: 1071 us of work a step but 21 us of critical path, so
+  even a perfect rewrite of it buys 0.7 %. Leave it alone unless the occupancy problem is
+  interesting for its own sake.
+- **SM slots are oversubscribed, not starved** (176 % of 148 x step), so "find idle time" is
+  the wrong frame for this step. Remove work from the dependency chain, do not hunt for gaps.
