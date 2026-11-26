@@ -354,6 +354,40 @@ The exposed part is not reachable by reserving SMs either: the routed pair occup
 grid cut below the resident capacity has every block launch, so CLC has nothing left to
 hand out and the leftover tiles are dropped -- the same trap as above, from the other side.
 
+### GEMM1 is the badly amortised one, and its fix is out of scope
+
+Profiled on the shipped grid at D=19 (`pipe_clc`, side 0):
+
+| | GEMM1 | GEMM2 |
+|---|---:|---:|
+| grid | 324 (9 x 36) | 1440 (40 x 36) |
+| CTAs launched | 148 | 148 |
+| waves per SM | **2.19** | 9.73 |
+| duration | 13.44 us | 9.95 us |
+| DRAM | 33.6 % | 25.3 % |
+| SM | 17.8 % | 14.0 % |
+| active warps | 24.8 % | ~25 % |
+| occupancy limit (smem) | 1 block | 1 block |
+| registers/thread | 128 | ~96 (the reg pool) |
+
+GEMM1 is the worse of the two: its tile space is only 9 x 36, so the fill is amortised
+over 2.19 tiles against GEMM2's 9.73, and that is why a kernel that moves more bytes than
+GEMM2 (1152 x 5120 a expert against 5120 x 640) runs 3.5 us longer at a *higher* DRAM
+percentage.
+
+Both ways to fix it are generator decisions, not edits to the sources under
+`sm103/moe/src`:
+
+- Two CTAs a multiprocessor would hide the fill behind a co-resident CTA, but it needs the
+  smem below 113 KB (GEMM1 asks 216832), the `__launch_bounds__(512, 1)` second argument
+  raised, and the register cap halved from 128 -- i.e. a different stage depth in
+  `launch.json` and the register pool, not a source change.
+- More tiles per CTA would need smaller M tiles, and tcgen05 `cta_group::1` has M = 128,
+  which is what makes 1152 rows exactly 9 units.
+
+So the fill stays until the routed pair is rebuilt at a profile that fits two CTAs an SM;
+that lives in the generator, outside `sgl-nvidia-mega`.
+
 Cross-process variance, distinct from the 0.03 us spread inside a run: the D=1 floor
 rebuilt and re-run came back 11.41 and then 10.88 us, so compare across launches only
 with ~0.5 us of slack.
