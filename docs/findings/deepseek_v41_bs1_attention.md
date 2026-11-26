@@ -488,3 +488,68 @@ steps fit in the buffer.
   the 3.53 ms step dominates is currently unsupported.
 - `--enable-layerwise-nvtx-marker` would give per-layer ranges directly and is the cheaper
   route to the same answer.
+
+### The decode profile, and the two things it says: 23 % of the step is dead GPU time, and the mHC coefficients are the largest kernel
+
+Captured decode on real 32k bench32k prompts with `--cuda-graph-trace=node` and the
+capture window opened only around the measured request. The warmup row fills the radix
+cache, so the measured row's prefill is ~0 (TTFT 135 ms after a 27 s warmup) and the
+window is decode. 50 complete steps, each bounded by the plugin's own `dsv41_bench_stamp`.
+
+**Fast path now on by default.** `attn_core_lean` moved from `OPT_IN_SLOTS` into
+`SHIPPED_SLOTS`/`DEFAULT_ON_SLOTS`, gated by `runtime._core_lean_on()`: it runs only when
+the v41_new KV layout is selected and `attn`, `swapab_h8`, `wo_a_g1` are all present, and
+turns itself off (rather than rejecting the request) when any is missing. The build's slot
+line now reads `muLLM's one-launch core 1-8 (v41_new KV layout only)` on every layer
+group. In the trace the swap-AB sparse MLA kernel (`flash_fwd_splitkv_mla_fp8_sparse`, was
+261 us/step) is replaced by `dsv41_core_lean_sparse_early` at 237 us/step.
+
+Per step (mean of 50, device 0, all eight ranks run the same shape):
+
+| | us/step | share |
+|---|---|---|
+| step wall (stamp to stamp) | 3606 | |
+| **union GPU busy** | **2781** | **77.1 %** |
+| **true GPU idle** | **825** | **22.9 %** |
+| kernel work (sum of durations) | 6153 | 2.21x parallelism |
+
+The 825 us of idle is not spread thin: 3.5 stalls over 50 us per step account for **652 of
+the 825**, and they sit before tiny `at::native::` elementwise kernels and before the next
+step's stamp -- at +682, +991 and +1067 us into the step. Gaps under 2 us contribute 50 us
+in total. So this is host/queue stalls at the draft/verify seam and at the step boundary,
+not launch overhead on the layer chain. **Cutting the idle is worth more than any kernel
+here**: 825 us of a 3606 us step is 23 %.
+
+Kernel work, in order (`us/step` is the sum of durations, so these overlap 2.21x):
+
+| us/step | n/step | kernel |
+|---|---|---|
+| 1070.6 | 86.0 | `dsv41_hc_coeff` |
+| 576.6 | 80.0 | `all_reduce_mhc_LamportMHC*` |
+| 499.4 | 43.0 | `dsv41_routed_expert_gemm1` |
+| 439.5 | 43.0 | `SwigluLowLatency` |
+| 371.6 | 58.0 | `dsl low_latency_blockscaled` |
+| 339.2 | 43.0 | `dsv41_wo_b_split` |
+| 330.8 | 43.0 | `dsv41_wo_a_fused` |
+| 320.4 | 43.0 | `dsv41_routed_expert_gemm2` |
+| 237.0 | 38.0 | `dsv41_core_lean_sparse_early` |
+| 232.1 | 32.0 | `dsv41_q_cluster8_fit` |
+
+**`dsv41_hc_coeff` is the largest single consumer of GPU work and it is 10 % occupied.**
+86 launches a step (43 layers, draft and verify), 12.5 us each. It launches
+(`slices`, 1, 1) = **16 CTAs** because `SLICES = 16` is `prenorm.SLICES`, DeepGEMM's
+`kNumSplits`, which the kernel's slice-ordered tail reduce must keep to stay bit for bit.
+On a 148-SM B300 those 16 CTAs occupy 10.8 % of the machine, so each call pays a full
+K-loop latency (28 chunks of 64) with nothing beside it. The kernel is already the fused
+fast path -- it replaced `tf32_hc_prenorm_gemm` (15.6 us) + `_hc_mix_reduce_sinkhorn`
+(7.4 us) = 23 us with one 12.5 us launch -- so the remaining lever is not another fusion
+but the occupancy, and that needs either a slice count the tail reduce still sums in
+DeepGEMM's order, or a second CTA an SM (92 KB of smem against 180 KB free).
+
+## Open (decode profile)
+
+- **The 825 us of idle** (3 host/seam stalls): this is the first thing to chase, and it is
+  worth 23 % of the step. Chase it with the host timeline in the same report, not with a
+  kernel.
+- `dsv41_hc_coeff` at 16 of 148 SMs: 1070 us of work a step. Anything that raises its
+  occupancy pays directly, if the slice order survives.
