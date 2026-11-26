@@ -235,6 +235,38 @@ Take the step times from the in-graph stamps (`events-r0.bin` + `layout-r0.json`
 verify-period median, and record the GPU compute process count per pass so a
 contaminated arm is visible rather than mysterious.
 
+## Slots that do not build at TP8 + EP2
+
+Worth recording so the next attempt does not repeat it. `draft_final_collapse` needs
+`draft_hop`, and `draft_stage0_first` needs `draft_stage0_table`. At attention TP8 + EP2
+the draft runs its own three-stage set (`draft_attn`, `draft_qfront`, `draft_wo_a`,
+`draft_swapab`, `draft_qkv_a`, `draft_wo_b_ll`, ...) and neither `draft_hop` nor
+`draft_stage0_table` is among the served slots, so listing the two dependents builds
+nothing. They were listed and simply did not appear in the served list; no error, no log
+line. Check the served list after a launch rather than assuming a listed slot took.
+
+`attn_index_q_first` did build and serve, and reads +17.9 tok/s on one run (1788.3 ->
+1806.2, step p50 2.843 -> 2.789 ms). One run, and this node's launch-to-launch spread is
+1.4 %, so it is not confirmed either; it is a candidate for the interleaved harness below,
+not a win to report.
+
+## What to do next
+
+The MoE is where the remaining time is, and it runs far below the memory roofline. Each
+verify step spends about 28 us a layer on the routed pair, 45 % of a layer's 61.6 us, and
+reads roughly 44 MB per rank to do it (6 rows, ~19 distinct experts, ~10 of them per EP
+half, ~4.2 MiB an expert per MoE-TP4 rank at the checkpoint's `[2304, 2560]` int8 w1/w3
+shapes). 44 MB in 28 us is about 1.6 TB/s against a B300's ~8 TB/s, so the gather runs at
+around 20 % of peak: latency- and occupancy-bound rather than bandwidth-bound, because 6
+rows give the MMA almost no work to hide it behind. That is the one lever left with more
+than a few percent of headroom, and it is deep kernel work (`sm103/moe/src/route*.cu`,
+`routed_expert_gemm.py`), not a slot to switch on.
+
+Before that, the harness: with the remaining per-slot effects at 0.5-1.5 % and this
+node's launch-to-launch spread at 1.4 %, a sequential A/B cannot resolve them. Interleave
+the arms inside one launch (same server, alternating timed windows) and read paired
+differences.
+
 ## Open
 
 - `attn_wo_a_fp8` and `attn_index_weights_bf16` stacked on `attn_core_lean` read
