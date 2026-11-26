@@ -444,3 +444,47 @@ differences.
 - `attn_cluster_merge` re-measured in a reproducible state.
 - An interleaved A/B/A harness: the drift above is the same size as the remaining
   headroom on this path, so it sets the resolution of everything measured after this.
+
+### Engram cannot live on the GPU under the megakernel, and the end-to-end nsys capture cannot see the decode step
+
+Three end-to-end results on the TP8 + EP2 target (8x B300, DSpark block 5, bench32 real
+prompts, `--enable-nvidia-megakernel`).
+
+**Engram placement is a hard constraint, not a tuning knob.** Launching with
+`--engram-config '{"placement": "gpu"}'` is rejected at startup:
+`--enable-nvidia-megakernel cannot run this setup: engram_config placement 'gpu',
+replication 'none': the Engram prefetch reads the per-rank host tables`. The megakernel's
+Engram prefetch is built on the per-rank host table, so `cpu` is the only legal placement
+while the megakernel is on. There is no CPU-vs-GPU Engram comparison to run.
+
+**The CPU arm is the reference: 1452.4 tok/s/user, step p50 3.532 ms** (step p99 4.81 ms,
+TTFT 407 ms) over 8 rows, and 1426.2 tok/s / 3.559 ms with nsys attached (~1.8 % tracer
+overhead). So the tracer costs less than the run-to-run spread and can be left on.
+
+**No megakernel kernel appears in the trace.** `report1.nsys-rep` (33.9 MB) holds 302 424
+kernels over a 4.60 s span and 195 distinct names, all flashinfer / cutlass / nvjet /
+torch / cub / sglang / deep_gemm -- not one of the plugin's kernels. Two causes:
+
+- Eight ranks in one session overrun the default CUDA buffer; only ~4.6 s of a ~11 s pass
+  survived, so the decode windows are mostly outside the capture.
+- Decode runs under a CUDA graph and nsys defaults to `--cuda-graph-trace=graph`, which
+  records the graph as one node. The per-step kernels are not expanded.
+
+What the captured slice does say, and it is worth recording: 39.9 % of kernel time is
+`trtllm_mnnvl_allreduce::twoshotAllreduceKernel` at 719 us a call, and 16.0 % is the
+prefill sparse attention -- i.e. **the captured region is prefill, and prefill is
+communication-bound**, which says nothing about the B=1 decode target. Engram itself is
+cheap there: `_engram_gather_kernel` 355 us x 432 and `_engram_gate_kernel` 189 us x 432,
+both prefill-scale, and 41 us a call in the isolated decode window. Engram on CPU is not a
+decode bottleneck.
+
+A usable decode profile needs `--cuda-graph-trace=node` with a raised
+`--cuda-buffer-size`, and a decode-only window (short ISL, or a cached prefix) so ~100
+steps fit in the buffer.
+
+## Open (end to end)
+
+- Re-capture decode with `--cuda-graph-trace=node`; every conclusion about which part of
+  the 3.53 ms step dominates is currently unsupported.
+- `--enable-layerwise-nvtx-marker` would give per-layer ranges directly and is the cheaper
+  route to the same answer.
