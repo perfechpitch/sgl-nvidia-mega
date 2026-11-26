@@ -343,6 +343,17 @@ launch would halve the fills, but it needs a grid-wide barrier between them, whi
 deadlock-free if every CTA is resident (grid <= 148); GEMM1's grid is 9 x 36 = 324, and
 shrinking it is exactly the trap above, so a fusion also has to solve the tile walk first.
 
+### The side stream's +4.0 us is mostly the shared expert itself
+
+Having the shared-expert-sized chain beside the routed pair costs 19.08 vs 15.04 us. It is
+not wasted scheduling. Run alone (routed pair removed), that chain takes 10.99 us a half
+including the 1.26 us spacer, so ~9.7 us of real work: separately 15.04 + 9.7 = 24.7 us,
+together 19.08, i.e. the overlap already recovers 5.6 us and only 4.0 us stays exposed.
+The exposed part is not reachable by reserving SMs either: the routed pair occupies all
+148 multiprocessors (180 KB of smem a CTA, `launch__occupancy_limit_shared_mem` 1), and a
+grid cut below the resident capacity has every block launch, so CLC has nothing left to
+hand out and the leftover tiles are dropped -- the same trap as above, from the other side.
+
 Cross-process variance, distinct from the 0.03 us spread inside a run: the D=1 floor
 rebuilt and re-run came back 11.41 and then 10.88 us, so compare across launches only
 with ~0.5 us of slack.
