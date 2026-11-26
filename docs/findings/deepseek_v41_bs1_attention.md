@@ -41,7 +41,10 @@ different regime across launches (another job of the same user started on the sa
 GPUs mid-session), so an arm is only compared against baselines taken in the same state,
 and every pass records the number of GPU compute processes.
 
-## `attn_core_lean`: measured
+## `attn_core_lean`: measured under fixed routing
+
+Read the number below as a kernel-chain bound; the live-router gain is smaller and is
+what the next section reports.
 
 Same slot list as the baseline plus `attn_core_lean`, on the KV layout it requires
 (`SGLANG_DSV4_KV_LAYOUT=v41_new`, 528-byte window rows and 288-byte FP4 compressed rows):
@@ -98,27 +101,76 @@ packaged microbenchmark's -3.3 us was one layer in isolation. Re-measurement in 
 reproducible state is needed before calling this a gain or a loss; it is not a win on
 the evidence so far.
 
-## Real prompts (bench32)
+## Real routing and real prompts: the gain is smaller
+
+The numbers above hold the routing fixed to remove arm-to-arm jitter. Running the three
+arms again with the router live (`SGLANG_NVIDIA_MEGAKERNEL_BENCH_FIXED_ROUTING=0`,
+everything else unchanged) and, per arm, also over 8 real bench32 rows:
+
+| Arm | Period median | Verify half | Draft half | bench32 step p50 | bench32 step p99 | TTFT p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline | 2775.1 us | 2521.9 us | 271.1 us | 2.891 ms | 4.121 ms | 400.6 ms |
+| `attn_core_lean` | 2727.8 us | 2447.7 us | 280.3 us | 2.842 ms | 3.753 ms | 386.7 ms |
+| `+attn_wo_a_fp8`, `+attn_index_weights_bf16` | 2738.2 us | 2462.7 us | 276.4 us | 2.850 ms | 3.730 ms | 387.2 ms |
+
+**The fixed-routing -183 us overstates the real-routing gain.** With the router live the
+period moves 47 us and the client's own step p50 moves 49 us, not 183. The whole
+difference is in the baseline: its verify half reads 2617.5 us under fixed routing and
+2521.9 us with the router live, while `attn_core_lean`'s reads 2443.6 and 2447.7 us — the
+core does not care, the baseline does. `synth` defaults to 19 distinct target experts per
+layer, dealt `half0=9` to one EP half and 10 to the other; a live router on these prompts
+evidently spreads a 6-row step differently. So the honest statement of the win is the
+real-routing one, and the fixed-routing number is a kernel-chain bound.
+
+### Paired per-row, the same 8 rows in every arm
+
+The client ran the identical rows in the identical order, so per-row pairs are the
+comparison least exposed to the drift noted below:
+
+| Row isl | baseline | `attn_core_lean` | stacked | lean - base | stacked - lean |
+| --- | --- | --- | --- | --- | --- |
+| 30355 | 1196.8 | 1239.8 | 1227.4 | +43.0 | -12.4 |
+| 30798 | 1236.0 | 1211.5 | 1215.6 | -24.5 | +4.1 |
+| 31140 | 1171.8 | 1242.1 | 1226.7 | +70.3 | -15.4 |
+| 31664 | 1182.1 | 1235.7 | 1201.5 | +53.6 | -34.2 |
+| 32041 | 1216.6 | 1228.3 | 1232.8 | +11.7 | +4.5 |
+| 32047 | 1258.8 | 1274.2 | 1250.1 | +15.4 | -24.1 |
+| 32833 | 1180.4 | 1233.9 | 1217.3 | +53.5 | -16.6 |
+| 34109 | 1180.2 | 1231.6 | 1284.7 | +51.4 | +53.1 |
+| **median** | 1189.5 | 1234.8 | 1227.0 | **+47.2** | **-13.9** |
+
+`attn_core_lean`: 7 of 8 rows faster, median +47.2 tok/s/user (+4.0 %), and the tail
+improves more than the median (p99 step 4.121 -> 3.753 ms, -9 %).
+
+**Stacking the two bitwise slots is not a win.** 5 of 8 rows drop, median -13.9. Both
+slots engaged (they are in the served list and `attn_wo_a_fp8` logged no decline, so its
+per-layer recovery was exact), so this is the pair's cost, not a refused slot. It is also
+the result the -13.1 and -7.7 us in the model page should have predicted: at this noise
+level the pair is not resolvable, and here it reads slightly negative. Keep `attn_core_lean`
+alone at TP8 unless this pair is re-measured to a resolved gain.
+
+## What the drift means for the method
+
+Two things this session showed, both worth building into the next measurement:
+
+- **Arms must be interleaved, not sequential.** Three arms ran back to back over 16
+  minutes and every arm's steps trended up within its own run (by thirds: `base`
+  2761.7 -> 2833.5 us, `lean` 2720.3 -> 2797.5, `stack` 2748.6 -> 2781.1). That drift is
+  50-70 us, the same size as the effect, so an arm that ran later starts behind. Only the
+  paired per-row comparison above is clean of it; the period medians are not.
+- **The first pass after capture is not a measurement.** The baseline's warm pass ran at
+  13.1 ms per step for its whole duration (the client's p50 for that pass: 17.6 ms) while
+  its next two passes ran at 2.755 and 2.779 ms. Whatever settles after capture has to
+  settle before the first timed pass; treat a slow first pass as a thrown-away pass, and
+  look at the per-pass numbers rather than an arm-wide median.
+
+## Real prompts (bench32), first look
 
 `bench/bench32k_client.py` (outside this package) sends each row's text prompt to
 `/generate` as ids and reads the decode step off the SSE chunk gaps, recording the same
-fields as `static_table.py` plus the row's real ISL. Preliminary, on `attn_core_lean`,
-3 rows of `lca-project-level-code-completion__small_context`, `--osl 256`:
-
-| isl | tok/s/user |
-| --- | --- |
-| 32041 | 1276.3 |
-| 27588 | 767.5 |
-| 32314 | 764.1 |
-
-Summary: step p50 4.086 ms, p10 2.716 ms, p90 5.527 ms, TTFT p50 454.8 ms.
-
-Two things this already says. The p10 (2.716 ms) sits on the fixed-routing p50
-(2.722 ms), so the fastest real-routing steps hit the same floor as the synthetic
-measurement; the p50 is 1.4 ms higher because real routing spreads each 6-row step over
-more distinct experts and the 32k context makes the compressed-index side heavier. And 3
-rows is too few to report: the first row is 66 % faster than the other two. A baseline
-arm on the same rows is still needed before any real-prompt delta is claimed.
+fields as `static_table.py` plus the row's real ISL. A first 3-row look on `attn_core_lean`
+read p10 2.716 ms against a p50 of 4.086 ms; the 8-row runs above supersede it (p10 2.755,
+p50 2.842), so that spread was the 3-row sample, not the context length.
 
 ## Reproducing
 
@@ -142,8 +194,9 @@ contaminated arm is visible rather than mysterious.
 
 ## Open
 
-- `attn_wo_a_fp8` and `attn_index_weights_bf16` stacked on `attn_core_lean`, same
-  method: `attn_wo_a_fp8` streams the very `wo_a` the lean core feeds, so the pair is
-  worth measuring rather than assuming.
+- `attn_wo_a_fp8` and `attn_index_weights_bf16` stacked on `attn_core_lean` read
+  slightly negative here (median -13.9 tok/s/user, 5 of 8 rows down); a resolved answer
+  needs interleaved arms and more rows, not another sequential run.
 - `attn_cluster_merge` re-measured in a reproducible state.
-- A bench32 baseline arm, and enough rows that the per-row spread is bracketed.
+- An interleaved A/B/A harness: the drift above is the same size as the remaining
+  headroom on this path, so it sets the resolution of everything measured after this.
