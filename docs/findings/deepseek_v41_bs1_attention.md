@@ -388,6 +388,30 @@ Both ways to fix it are generator decisions, not edits to the sources under
 So the fill stays until the routed pair is rebuilt at a profile that fits two CTAs an SM;
 that lives in the generator, outside `sgl-nvidia-mega`.
 
+### The CTA prologue is only 0.83 us, and a deeper K pipeline is the wrong direction
+
+Instrumented `gemm1.cu` with `%globaltimer` stamps through the clamp pointer (read-only in
+the work loop) and read them back on one CTA: entry -> barrier init 0.32 us, -> tmem alloc
+0.19 us, -> kernel exit 0.32 us, **0.83 us of prologue in total**. Optimising the prologue
+is therefore not a lever, and a 7.45 us figure that a zero-tile run produces is an
+artefact: with no tiles to steal, cluster launch control cancels nothing, all 1440 blocks
+launch one after another (9.73 serial waves at 1 CTA an SM) and each pays its 0.83 us.
+Measured that way a zero-tile run is 6.09 us at grid y = 1 and 7.45 us at y = 36, of which
+the grid-dependent part (the drain) is only 1.36 us.
+
+GEMM1's K loop is 10 chunks against 3 stages, which looks like an under-filled pipeline and
+invites "use more stages". That is backwards here: fill costs one stage each, and each CTA
+only runs **2.19 tiles** (GEMM2 runs 9.73), so this launch is ~45 % fill already and every
+extra stage adds more prologue than it hides. The lever would be fewer, larger chunks, and
+that needs the A box in `_weight_map` and the four MMA descriptor offsets in `gemm1.cu`
+(+0, +16384, +32768, +49152 within a 65536-byte stage) to change together -- generator
+tiling, not a local edit.
+
+The measured shape of the routed pair, all in one place: marginal expert 0.21 us, first
+expert 11.4 us (D=1), 19 experts 15.04 us; GEMM1 alone 13.44 us, GEMM2 alone 9.95 us, the
+pair 15.04 us, so PDL already overlaps most of GEMM1 under GEMM2. It is a latency chain,
+not a bandwidth or occupancy problem, and the chain is the K loop.
+
 Cross-process variance, distinct from the 0.03 us spread inside a run: the D=1 floor
 rebuilt and re-run came back 11.41 and then 10.88 us, so compare across launches only
 with ~0.5 us of slack.
